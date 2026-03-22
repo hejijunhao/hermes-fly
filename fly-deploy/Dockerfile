@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+# System deps: nodejs for hermes browser tools, flyctl for deployments
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates nodejs npm \
+    && curl -L https://fly.io/install.sh | sh \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.fly/bin:${PATH}"
+
+# Copy hermes-agent source and install with all extras
+COPY . /opt/hermes-agent/
+RUN cd /opt/hermes-agent \
+    && mkdir -p tinker-atropos/logs \
+    && pip install --no-cache-dir -e ".[all]" \
+    && pip install --no-cache-dir mini-swe-agent
+
+# Web app deps (FastAPI + xterm.js bridge)
+RUN pip install --no-cache-dir uvicorn fastapi python-multipart httpx
+
+# Create the ~/.hermes directory structure the CLI expects
+RUN mkdir -p /root/.hermes/{sessions,logs,memories,skills,hooks,cron,image_cache,audio_cache}
+
+# Copy default config files from the repo
+RUN cp /opt/hermes-agent/.env.example /root/.hermes/.env \
+    && cp /opt/hermes-agent/cli-config.yaml.example /root/.hermes/config.yaml 2>/dev/null; true
+
+# Copy web app into /app
+COPY fly-deploy/app.py /app/app.py
+COPY fly-deploy/static/ /app/static/
+COPY fly-deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh"]

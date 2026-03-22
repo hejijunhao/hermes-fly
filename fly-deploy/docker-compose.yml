@@ -1,0 +1,14 @@
+# Local development — run from repo root:
+#   docker compose -f fly-deploy/docker-compose.yml up --build
+services:
+  hermes:
+    build:
+      context: ..
+      dockerfile: fly-deploy/Dockerfile
+    ports:
+      - "8081:8080"
+    env_file:
+      - ../.env
+    environment:
+      - TTYD_PASS=${TTYD_PASS:-}
+      - SESSION_SECRET=${SESSION_SECRET:-}

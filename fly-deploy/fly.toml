@@ -1,0 +1,19 @@
+# Hermes Agent — CLI served via web terminal on Fly.io
+# Deploy from repo root: fly deploy --config fly-deploy/fly.toml --dockerfile fly-deploy/Dockerfile
+app = 'hermes-fly'
+primary_region = 'sin'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+
+[mounts]
+  source = "hermes_data"
+  destination = "/root/.hermes"
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '1024mb'
