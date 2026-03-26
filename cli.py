@@ -70,10 +70,10 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import get_hermes_home, OPENROUTER_BASE_URL
 from hermes_cli.env_loader import load_hermes_dotenv
 
-_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+_hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
@@ -112,21 +112,12 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
 
 
 def _parse_reasoning_config(effort: str) -> dict | None:
-    """Parse a reasoning effort level into an OpenRouter reasoning config dict.
-    
-    Valid levels: "xhigh", "high", "medium", "low", "minimal", "none".
-    Returns None to use the default (medium), or a config dict to override.
-    """
-    if not effort or not effort.strip():
-        return None
-    effort = effort.strip().lower()
-    if effort == "none":
-        return {"enabled": False}
-    valid = ("xhigh", "high", "medium", "low", "minimal")
-    if effort in valid:
-        return {"enabled": True, "effort": effort}
-    logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
-    return None
+    """Parse a reasoning effort level into an OpenRouter reasoning config dict."""
+    from hermes_constants import parse_reasoning_effort
+    result = parse_reasoning_effort(effort)
+    if effort and effort.strip() and result is None:
+        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+    return result
 
 
 def load_cli_config() -> Dict[str, Any]:
@@ -458,13 +449,8 @@ from run_agent import AIAgent
 from model_tools import get_tool_definitions, get_toolset_for_tool
 
 # Extracted CLI modules (Phase 3)
-from hermes_cli.banner import (
-    cprint as _cprint, _GOLD, _BOLD, _DIM, _RST,
-    HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
-    build_welcome_banner,
-)
-from hermes_cli.commands import COMMANDS, SlashCommandCompleter, SlashCommandAutoSuggest
-from hermes_cli import callbacks as _callbacks
+from hermes_cli.banner import build_welcome_banner
+from hermes_cli.commands import SlashCommandCompleter, SlashCommandAutoSuggest
 from toolsets import get_all_toolsets, get_toolset_info, validate_toolset
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
@@ -1054,6 +1040,8 @@ class HermesCLI:
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
         self._stream_box_opened = False  # True once the response box header is printed
+        self._reasoning_stream_started = False  # True once live reasoning starts streaming
+        self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
         
         # Configuration - priority: CLI args > env vars > config file
         # Model comes from: CLI arg or config.yaml (single source of truth).
@@ -1186,8 +1174,8 @@ class HermesCLI:
         try:
             from hermes_state import SessionDB
             self._session_db = SessionDB()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
         
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
@@ -1478,10 +1466,107 @@ class HermesCLI:
 
     def _on_thinking(self, text: str) -> None:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
+        if not text:
+            self._flush_reasoning_preview(force=True)
         self._spinner_text = text or ""
         self._invalidate()
 
     # ── Streaming display ────────────────────────────────────────────────
+
+    def _current_reasoning_callback(self):
+        """Return the active reasoning display callback for the current mode."""
+        if self.show_reasoning and self.streaming_enabled:
+            return self._stream_reasoning_delta
+        if self.verbose and not self.show_reasoning:
+            return self._on_reasoning
+        return None
+
+    def _emit_reasoning_preview(self, reasoning_text: str) -> None:
+        """Render a buffered reasoning preview as a single [thinking] block."""
+        import re
+        import textwrap
+
+        preview_text = reasoning_text.strip()
+        if not preview_text:
+            return
+
+        try:
+            term_width = shutil.get_terminal_size().columns
+        except Exception:
+            term_width = 80
+        prefix = "  [thinking] "
+        wrap_width = max(30, term_width - len(prefix) - 2)
+
+        paragraphs = []
+        raw_paragraphs = re.split(r"\n\s*\n+", preview_text.replace("\r\n", "\n"))
+        for paragraph in raw_paragraphs:
+            compact = " ".join(line.strip() for line in paragraph.splitlines() if line.strip())
+            if compact:
+                paragraphs.append(textwrap.fill(compact, width=wrap_width))
+        preview_text = "\n".join(paragraphs)
+        if not preview_text:
+            return
+
+        if self.verbose:
+            _cprint(f"  {_DIM}[thinking] {preview_text}{_RST}")
+            return
+
+        lines = preview_text.splitlines()
+        if len(lines) > 5:
+            preview = "\n".join(lines[:5])
+            preview += f"\n  ... ({len(lines) - 5} more lines)"
+        else:
+            preview = preview_text
+        _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+
+    def _flush_reasoning_preview(self, *, force: bool = False) -> None:
+        """Flush buffered reasoning text at natural boundaries.
+
+        Some providers stream reasoning in tiny word or punctuation chunks.
+        Buffer them here so the preview path does not print one `[thinking]`
+        line per token.
+        """
+        buf = getattr(self, "_reasoning_preview_buf", "")
+        if not buf:
+            return
+
+        try:
+            term_width = shutil.get_terminal_size().columns
+        except Exception:
+            term_width = 80
+        target_width = max(40, term_width - len("  [thinking] ") - 4)
+
+        flush_text = ""
+
+        if force:
+            flush_text = buf
+            buf = ""
+        else:
+            line_break = buf.rfind("\n")
+            min_newline_flush = max(16, target_width // 3)
+            if line_break != -1 and (
+                line_break >= min_newline_flush
+                or buf.endswith("\n\n")
+                or buf.endswith(".\n")
+                or buf.endswith("!\n")
+                or buf.endswith("?\n")
+                or buf.endswith(":\n")
+            ):
+                flush_text = buf[: line_break + 1]
+                buf = buf[line_break + 1 :]
+            elif len(buf) >= target_width:
+                search_start = max(20, target_width // 2)
+                search_end = min(len(buf), max(target_width + (target_width // 3), target_width + 8))
+                cut = -1
+                for boundary in (" ", "\t", ".", "!", "?", ",", ";", ":"):
+                    cut = max(cut, buf.rfind(boundary, search_start, search_end))
+                if cut != -1:
+                    flush_text = buf[: cut + 1]
+                    buf = buf[cut + 1 :]
+
+        self._reasoning_preview_buf = buf.lstrip() if flush_text else buf
+        if flush_text:
+            self._emit_reasoning_preview(flush_text)
 
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
@@ -1496,6 +1581,7 @@ class HermesCLI:
         """
         if not text:
             return
+        self._reasoning_stream_started = True
         if getattr(self, "_stream_box_opened", False):
             return
 
@@ -1509,10 +1595,14 @@ class HermesCLI:
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
 
-        # Emit complete lines
+        # Emit complete lines, and force-flush long partial lines so
+        # reasoning is visible in real-time even without newlines.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
             _cprint(f"{_DIM}{line}{_RST}")
+        if len(self._reasoning_buf) > 80:
+            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
+            self._reasoning_buf = ""
 
     def _close_reasoning_box(self) -> None:
         """Close the live reasoning box if it's open."""
@@ -1687,11 +1777,13 @@ class HermesCLI:
         self._stream_buf = ""
         self._stream_started = False
         self._stream_box_opened = False
+        self._reasoning_stream_started = False
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
         self._in_reasoning_block = False
         self._reasoning_box_opened = False
         self._reasoning_buf = ""
+        self._reasoning_preview_buf = ""
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -1848,7 +1940,7 @@ class HermesCLI:
                 from hermes_state import SessionDB
                 self._session_db = SessionDB()
             except Exception as e:
-                logger.debug("SQLite session store not available: %s", e)
+                logger.warning("SQLite session store not available — session will NOT be indexed: %s", e)
         
         # If resuming, validate the session exists and load its history.
         # _preload_resumed_session() may have already loaded it (called from
@@ -1922,11 +2014,7 @@ class HermesCLI:
                 platform="cli",
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
-                reasoning_callback=(
-                    self._stream_reasoning_delta if (self.streaming_enabled and self.show_reasoning)
-                    else self._on_reasoning if (self.show_reasoning or self.verbose)
-                    else None
-                ),
+                reasoning_callback=self._current_reasoning_callback(),
                 honcho_session_key=None,  # resolved by run_agent via config sessions map / title
                 fallback_model=self._fallback_model,
                 thinking_callback=self._on_thinking,
@@ -2219,7 +2307,7 @@ class HermesCLI:
         """
         from hermes_cli.clipboard import save_clipboard_image
 
-        img_dir = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "images"
+        img_dir = get_hermes_home() / "images"
         self._image_counter += 1
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         img_path = img_dir / f"clip_{ts}_{self._image_counter}.png"
@@ -2239,7 +2327,7 @@ class HermesCLI:
             /rollback diff <N>        — preview changes since checkpoint N
             /rollback <N> <file>      — restore a single file from checkpoint N
         """
-        from tools.checkpoint_manager import CheckpointManager, format_checkpoint_list
+        from tools.checkpoint_manager import format_checkpoint_list
 
         if not hasattr(self, 'agent') or not self.agent:
             print("  No active agent session.")
@@ -2439,7 +2527,7 @@ class HermesCLI:
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
         try:
-            from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
+            from model_tools import check_tool_availability
             
             available, unavailable = check_tool_availability()
             
@@ -2779,7 +2867,7 @@ class HermesCLI:
         if self.agent and self.conversation_history:
             try:
                 self.agent.flush_memories(self.conversation_history)
-            except Exception:
+            except (Exception, KeyboardInterrupt):
                 pass
 
         old_session_id = self.session_id
@@ -3927,7 +4015,13 @@ class HermesCLI:
                 if not response and result and result.get("error"):
                     response = f"Error: {result['error']}"
 
-                # Display result in the CLI (thread-safe via patch_stdout)
+                # Display result in the CLI (thread-safe via patch_stdout).
+                # Force a TUI refresh first so spinner/status bar don't overlap
+                # with the output (fixes #2718).
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)  # brief pause for refresh
                 print()
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 _cprint(f"  ✅ Background task #{task_num} complete")
@@ -3964,6 +4058,11 @@ class HermesCLI:
                     sys.stdout.flush()
 
             except Exception as e:
+                # Same TUI refresh pattern as success path (#2718)
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
                 print()
                 _cprint(f"  ❌ Background task #{task_num} failed: {e}")
             finally:
@@ -4021,7 +4120,6 @@ class HermesCLI:
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chrome CDP connection."""
         import platform as _plat
-        import subprocess as _sp
 
         parts = cmd.strip().split(None, 1)
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
@@ -4231,11 +4329,7 @@ class HermesCLI:
         if self.agent:
             self.agent.verbose_logging = self.verbose
             self.agent.quiet_mode = not self.verbose
-            # Auto-enable reasoning display in verbose mode
-            if self.verbose:
-                self.agent.reasoning_callback = self._on_reasoning
-            elif not self.show_reasoning:
-                self.agent.reasoning_callback = None
+            self.agent.reasoning_callback = self._current_reasoning_callback()
 
         # Use raw ANSI codes via _cprint so the output is routed through
         # prompt_toolkit's renderer.  self.console.print() with Rich markup
@@ -4282,7 +4376,7 @@ class HermesCLI:
         if arg in ("show", "on"):
             self.show_reasoning = True
             if self.agent:
-                self.agent.reasoning_callback = self._on_reasoning
+                self.agent.reasoning_callback = self._current_reasoning_callback()
             save_config_value("display.show_reasoning", True)
             _cprint(f"  {_GOLD}✓ Reasoning display: ON (saved){_RST}")
             _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
@@ -4290,7 +4384,7 @@ class HermesCLI:
         if arg in ("hide", "off"):
             self.show_reasoning = False
             if self.agent:
-                self.agent.reasoning_callback = None
+                self.agent.reasoning_callback = self._current_reasoning_callback()
             save_config_value("display.show_reasoning", False)
             _cprint(f"  {_GOLD}✓ Reasoning display: OFF (saved){_RST}")
             return
@@ -4313,17 +4407,10 @@ class HermesCLI:
 
     def _on_reasoning(self, reasoning_text: str):
         """Callback for intermediate reasoning display during tool-call loops."""
-        if self.verbose:
-            # Verbose mode: show full reasoning text
-            _cprint(f"  {_DIM}[thinking] {reasoning_text.strip()}{_RST}")
-        else:
-            lines = reasoning_text.strip().splitlines()
-            if len(lines) > 5:
-                preview = "\n".join(lines[:5])
-                preview += f"\n  ... ({len(lines) - 5} more lines)"
-            else:
-                preview = reasoning_text.strip()
-            _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+        if not reasoning_text:
+            return
+        self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
+        self._flush_reasoning_preview(force=False)
 
     def _manual_compress(self):
         """Manually trigger context compression on the current conversation."""
@@ -4534,7 +4621,7 @@ class HermesCLI:
         sees the updated tools on the next turn.
         """
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _load_mcp_config, _servers, _lock
+            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
             # Capture old server names
             with _lock:
@@ -4854,7 +4941,6 @@ class HermesCLI:
         try:
             from tools.tts_tool import text_to_speech_tool
             from tools.voice_mode import play_audio_file
-            import json
             import re
 
             # Strip markdown and non-speech content for cleaner TTS
@@ -5624,7 +5710,7 @@ class HermesCLI:
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.
-            if self.show_reasoning and result and not self._stream_started:
+            if self.show_reasoning and result and not self._reasoning_stream_started:
                 reasoning = result.get("last_reasoning")
                 if reasoning:
                     w = shutil.get_terminal_size().columns
@@ -6377,12 +6463,31 @@ class HermesCLI:
             When the terminal supports bracketed paste, Ctrl+V / Cmd+V
             triggers this with the pasted text.  We also check the
             clipboard for an image on every paste event.
+
+            Large pastes (5+ lines) are collapsed to a file reference
+            placeholder while preserving any existing user text in the
+            buffer.
             """
             pasted_text = event.data or ""
             if self._try_attach_clipboard_image():
                 event.app.invalidate()
             if pasted_text:
-                event.current_buffer.insert_text(pasted_text)
+                line_count = pasted_text.count('\n')
+                buf = event.current_buffer
+                if line_count >= 5 and not buf.text.strip().startswith('/'):
+                    _paste_counter[0] += 1
+                    paste_dir = _hermes_home / "pastes"
+                    paste_dir.mkdir(parents=True, exist_ok=True)
+                    paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
+                    paste_file.write_text(pasted_text, encoding="utf-8")
+                    placeholder = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"
+                    prefix = ""
+                    if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != '\n':
+                        prefix = "\n"
+                    _paste_just_collapsed[0] = True
+                    buf.insert_text(prefix + placeholder)
+                else:
+                    buf.insert_text(pasted_text)
 
         @kb.add('c-v')
         def handle_ctrl_v(event):
@@ -6428,8 +6533,7 @@ class HermesCLI:
             """Return provider/model info for /model autocomplete."""
             try:
                 from hermes_cli.models import (
-                    _PROVIDER_LABELS, _PROVIDER_MODELS, normalize_provider,
-                    provider_model_ids,
+                    _PROVIDER_LABELS, normalize_provider, provider_model_ids,
                 )
                 current = getattr(cli_ref, "provider", None) or getattr(cli_ref, "requested_provider", "openrouter")
                 current = normalize_provider(current)
@@ -6496,15 +6600,25 @@ class HermesCLI:
         # Paste collapsing: detect large pastes and save to temp file
         _paste_counter = [0]
         _prev_text_len = [0]
+        _paste_just_collapsed = [False]
 
         def _on_text_changed(buf):
-            """Detect large pastes and collapse them to a file reference."""
+            """Detect large pastes and collapse them to a file reference.
+
+            When bracketed paste is available, handle_paste collapses
+            large pastes directly.  This handler is a fallback for
+            terminals without bracketed paste support.
+            """
             text = buf.text
-            line_count = text.count('\n')
             chars_added = len(text) - _prev_text_len[0]
             _prev_text_len[0] = len(text)
+            if _paste_just_collapsed[0]:
+                _paste_just_collapsed[0] = False
+                return
+            line_count = text.count('\n')
             # Heuristic: a real paste adds many characters at once (not just a
             # single newline from Alt+Enter) AND the result has 5+ lines.
+            # Fallback for terminals without bracketed paste support.
             if line_count >= 5 and chars_added > 1 and not text.startswith('/'):
                 _paste_counter[0] += 1
                 # Save to temp file
@@ -6513,7 +6627,7 @@ class HermesCLI:
                 paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
                 paste_file.write_text(text, encoding="utf-8")
                 # Replace buffer with compact reference
-                buf.text = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines → {paste_file}]"
+                buf.text = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"
                 buf.cursor_position = len(buf.text)
 
         input_area.buffer.on_text_changed += _on_text_changed
@@ -7028,23 +7142,33 @@ class HermesCLI:
                     
                     # Expand paste references back to full content
                     import re as _re
-                    paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input) if isinstance(user_input, str) else None
-                    if paste_match:
-                        paste_path = Path(paste_match.group(1))
+                    _paste_ref_re = _re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
+                    paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
+                    if paste_refs:
+                        def _expand_ref(m):
+                            p = Path(m.group(1))
+                            return p.read_text(encoding="utf-8") if p.exists() else m.group(0)
+                        expanded = _paste_ref_re.sub(_expand_ref, user_input)
+                        total_lines = expanded.count('\n') + 1
+                        n_pastes = len(paste_refs)
                         _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
-                        if paste_path.exists():
-                            full_text = paste_path.read_text(encoding="utf-8")
-                            line_count = full_text.count('\n') + 1
-                            print()
-                            ChatConsole().print(_user_bar)
+                        print()
+                        ChatConsole().print(_user_bar)
+                        # Show any surrounding user text alongside the paste summary
+                        split_parts = _paste_ref_re.split(user_input)
+                        visible_user_text = " ".join(
+                            split_parts[i].strip() for i in range(0, len(split_parts), 2) if split_parts[i].strip()
+                        )
+                        if visible_user_text:
                             ChatConsole().print(
-                                f"[bold {_accent_hex()}]●[/] [bold]{_escape(f'[Pasted text: {line_count} lines]')}[/]"
+                                f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(visible_user_text)}[/] "
+                                f"[dim]({n_pastes} pasted block{'s' if n_pastes > 1 else ''}, {total_lines} lines total)[/]"
                             )
-                            user_input = full_text
                         else:
-                            print()
-                            ChatConsole().print(_user_bar)
-                            ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]")
+                            ChatConsole().print(
+                                f"[bold {_accent_hex()}]\u25cf[/] [bold]{_escape(f'[Pasted text: {total_lines} lines]')}[/]"
+                            )
+                        user_input = expanded
                     else:
                         _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
                         if '\n' in user_input:
@@ -7115,7 +7239,7 @@ class HermesCLI:
             if self.agent and self.conversation_history:
                 try:
                     self.agent.flush_memories(self.conversation_history)
-                except Exception:
+                except (Exception, KeyboardInterrupt):
                     pass
             # Shut down voice recorder (release persistent audio stream)
             if hasattr(self, '_voice_recorder') and self._voice_recorder:

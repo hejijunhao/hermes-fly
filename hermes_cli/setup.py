@@ -283,7 +283,6 @@ from hermes_cli.config import (
     save_env_value,
     get_env_value,
     ensure_hermes_home,
-    DEFAULT_CONFIG,
 )
 
 from hermes_cli.colors import Colors, color
@@ -798,15 +797,11 @@ def setup_model_provider(config: dict):
     """Configure the inference provider and default model."""
     from hermes_cli.auth import (
         get_active_provider,
-        get_provider_auth_state,
         PROVIDER_REGISTRY,
-        format_auth_error,
-        AuthError,
         fetch_nous_models,
         resolve_nous_runtime_credentials,
         _update_config_for_provider,
         _login_openai_codex,
-        get_codex_auth_status,
         resolve_codex_runtime_credentials,
         DEFAULT_CODEX_BASE_URL,
         detect_external_credentials,
@@ -975,7 +970,7 @@ def setup_model_provider(config: dict):
         print()
 
         try:
-            from hermes_cli.auth import _login_nous, ProviderConfig
+            from hermes_cli.auth import _login_nous
             import argparse
 
             mock_args = argparse.Namespace(
@@ -3106,6 +3101,10 @@ def run_setup_wizard(args):
       hermes setup tools     — just tool configuration
       hermes setup agent     — just agent settings
     """
+    from hermes_cli.config import is_managed, managed_error
+    if is_managed():
+        managed_error("run setup wizard")
+        return
     ensure_hermes_home()
 
     config = load_config()
@@ -3299,7 +3298,6 @@ def _run_quick_setup(config: dict, hermes_home):
         get_missing_env_vars,
         get_missing_config_fields,
         check_config_version,
-        migrate_config,
     )
 
     print()

@@ -45,11 +45,13 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
+from hermes_constants import get_hermes_home
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
 
-_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+_hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 _loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 if _loaded_env_paths:
@@ -65,7 +67,6 @@ from tools.terminal_tool import cleanup_vm
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
-import requests
 
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -162,11 +163,15 @@ def _install_safe_stdio() -> None:
 
 
 class IterationBudget:
-    """Thread-safe shared iteration counter for parent and child agents.
+    """Thread-safe iteration counter for an agent.
 
-    Tracks total LLM-call iterations consumed across a parent agent and all
-    its subagents.  A single ``IterationBudget`` is created by the parent
-    and passed to every child so they share the same cap.
+    Each agent (parent or subagent) gets its own ``IterationBudget``.
+    The parent's budget is capped at ``max_iterations`` (default 90).
+    Each subagent gets an independent budget capped at
+    ``delegation.max_iterations`` (default 50) — this means total
+    iterations across parent + subagents can exceed the parent's cap.
+    Users control the per-subagent limit via ``delegation.max_iterations``
+    in config.yaml.
 
     ``execute_code`` (programmatic tool calling) iterations are refunded via
     :meth:`refund` so they don't eat into the budget.
@@ -852,7 +857,7 @@ class AIAgent:
             self.session_id = f"{timestamp_str}_{short_uuid}"
         
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
-        hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
@@ -887,7 +892,8 @@ class AIAgent:
                     user_id=None,
                 )
             except Exception as e:
-                logger.debug("Session DB create_session failed: %s", e)
+                logger.warning("Session DB create_session failed — messages will NOT be indexed: %s", e)
+                self._session_db = None  # prevent silent data loss on every subsequent flush
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -1321,6 +1327,24 @@ class AIAgent:
                     summary = detail.get('summary') or detail.get('content') or detail.get('text')
                     if summary and summary not in reasoning_parts:
                         reasoning_parts.append(summary)
+
+        # Some providers embed reasoning directly inside assistant content
+        # instead of returning structured reasoning fields.  Only fall back
+        # to inline extraction when no structured reasoning was found.
+        content = getattr(assistant_message, "content", None)
+        if not reasoning_parts and isinstance(content, str) and content:
+            inline_patterns = (
+                r"<think>(.*?)</think>",
+                r"<thinking>(.*?)</thinking>",
+                r"<reasoning>(.*?)</reasoning>",
+                r"<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>",
+            )
+            for pattern in inline_patterns:
+                flags = re.DOTALL | re.IGNORECASE
+                for block in re.findall(pattern, content, flags=flags):
+                    cleaned = block.strip()
+                    if cleaned and cleaned not in reasoning_parts:
+                        reasoning_parts.append(cleaned)
         
         # Combine all reasoning parts
         if reasoning_parts:
@@ -1540,10 +1564,13 @@ class AIAgent:
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
                     finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
-            logger.debug("Session DB append_message failed: %s", e)
+            logger.warning("Session DB append_message failed: %s", e)
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -3574,6 +3601,10 @@ class AIAgent:
         request_client_holder = {"client": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
+        # Wall-clock timestamp of the last real streaming chunk.  The outer
+        # poll loop uses this to detect stale connections that keep receiving
+        # SSE keep-alive pings but no actual data.
+        last_chunk_time = {"t": time.time()}
 
         def _fire_first_delta():
             if not first_delta_fired["done"] and on_first_delta:
@@ -3585,7 +3616,20 @@ class AIAgent:
 
         def _call_chat_completions():
             """Stream a chat completions response."""
-            stream_kwargs = {**api_kwargs, "stream": True, "stream_options": {"include_usage": True}}
+            import httpx as _httpx
+            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 900.0))
+            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+            stream_kwargs = {
+                **api_kwargs,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "timeout": _httpx.Timeout(
+                    connect=30.0,
+                    read=_stream_read_timeout,
+                    write=_base_timeout,
+                    pool=30.0,
+                ),
+            }
             request_client_holder["client"] = self._create_request_openai_client(
                 reason="chat_completion_stream_request"
             )
@@ -3601,6 +3645,8 @@ class AIAgent:
             usage_obj = None
 
             for chunk in stream:
+                last_chunk_time["t"] = time.time()
+
                 if self._interrupt_requested:
                     break
 
@@ -3640,6 +3686,7 @@ class AIAgent:
                                 "id": tc_delta.id or "",
                                 "type": "function",
                                 "function": {"name": "", "arguments": ""},
+                                "extra_content": None,
                             }
                         entry = tool_calls_acc[idx]
                         if tc_delta.id:
@@ -3649,10 +3696,18 @@ class AIAgent:
                                 entry["function"]["name"] += tc_delta.function.name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
+                        extra = getattr(tc_delta, "extra_content", None)
+                        if extra is None and hasattr(tc_delta, "model_extra"):
+                            extra = (tc_delta.model_extra or {}).get("extra_content")
+                        if extra is not None:
+                            if hasattr(extra, "model_dump"):
+                                extra = extra.model_dump()
+                            entry["extra_content"] = extra
                         # Fire once per tool when the full name is available
                         name = entry["function"]["name"]
                         if name and idx not in tool_gen_notified:
                             tool_gen_notified.add(idx)
+                            _fire_first_delta()
                             self._fire_tool_gen_started(name)
 
                 if chunk.choices[0].finish_reason:
@@ -3672,6 +3727,7 @@ class AIAgent:
                     mock_tool_calls.append(SimpleNamespace(
                         id=tc["id"],
                         type=tc["type"],
+                        extra_content=tc.get("extra_content"),
                         function=SimpleNamespace(
                             name=tc["function"]["name"],
                             arguments=tc["function"]["arguments"],
@@ -3721,6 +3777,7 @@ class AIAgent:
                             has_tool_use = True
                             tool_name = getattr(block, "name", None)
                             if tool_name:
+                                _fire_first_delta()
                                 self._fire_tool_gen_started(tool_name)
 
                     elif event_type == "content_block_delta":
@@ -3742,38 +3799,116 @@ class AIAgent:
                 return stream.get_final_message()
 
         def _call():
+            import httpx as _httpx
+
+            _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
+
             try:
-                if self.api_mode == "anthropic_messages":
-                    self._try_refresh_anthropic_client_credentials()
-                    result["response"] = _call_anthropic()
-                else:
-                    result["response"] = _call_chat_completions()
-            except Exception as e:
-                if deltas_were_sent["yes"]:
-                    # Streaming failed AFTER some tokens were already delivered
-                    # to consumers. Don't fall back — that would cause
-                    # double-delivery (partial streamed + full non-streamed).
-                    # Let the error propagate; the partial content already
-                    # reached the user via the stream.
-                    logger.warning("Streaming failed after partial delivery, not falling back: %s", e)
-                    result["error"] = e
-                else:
-                    # Streaming failed before any tokens reached consumers.
-                    # Safe to fall back to the standard non-streaming path.
-                    logger.info("Streaming failed before delivery, falling back to non-streaming: %s", e)
+                for _stream_attempt in range(_max_stream_retries + 1):
                     try:
-                        result["response"] = self._interruptible_api_call(api_kwargs)
-                    except Exception as fallback_err:
-                        result["error"] = fallback_err
+                        if self.api_mode == "anthropic_messages":
+                            self._try_refresh_anthropic_client_credentials()
+                            result["response"] = _call_anthropic()
+                        else:
+                            result["response"] = _call_chat_completions()
+                        return  # success
+                    except Exception as e:
+                        if deltas_were_sent["yes"]:
+                            # Streaming failed AFTER some tokens were already
+                            # delivered.  Don't retry or fall back — partial
+                            # content already reached the user.
+                            logger.warning(
+                                "Streaming failed after partial delivery, not retrying: %s", e
+                            )
+                            result["error"] = e
+                            return
+
+                        _is_timeout = isinstance(
+                            e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
+                        )
+                        _is_conn_err = isinstance(
+                            e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
+                        )
+
+                        if _is_timeout or _is_conn_err:
+                            # Transient network / timeout error. Retry the
+                            # streaming request with a fresh connection first.
+                            if _stream_attempt < _max_stream_retries:
+                                logger.info(
+                                    "Streaming attempt %s/%s failed (%s: %s), "
+                                    "retrying with fresh connection...",
+                                    _stream_attempt + 1,
+                                    _max_stream_retries + 1,
+                                    type(e).__name__,
+                                    e,
+                                )
+                                # Close the stale request client before retry
+                                stale = request_client_holder.get("client")
+                                if stale is not None:
+                                    self._close_request_openai_client(
+                                        stale, reason="stream_retry_cleanup"
+                                    )
+                                    request_client_holder["client"] = None
+                                continue
+                            logger.warning(
+                                "Streaming exhausted %s retries on transient error, "
+                                "falling back to non-streaming: %s",
+                                _max_stream_retries + 1,
+                                e,
+                            )
+                        else:
+                            _err_lower = str(e).lower()
+                            _is_stream_unsupported = (
+                                "stream" in _err_lower
+                                and "not supported" in _err_lower
+                            )
+                            if _is_stream_unsupported:
+                                self._safe_print(
+                                    "\n⚠  Streaming is not supported for this "
+                                    "model/provider. Falling back to non-streaming.\n"
+                                    "   To avoid this delay, set display.streaming: false "
+                                    "in config.yaml\n"
+                                )
+                            logger.info(
+                                "Streaming failed before delivery, falling back to non-streaming: %s",
+                                e,
+                            )
+
+                        try:
+                            result["response"] = self._interruptible_api_call(api_kwargs)
+                        except Exception as fallback_err:
+                            result["error"] = fallback_err
+                        return
             finally:
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
+        _stream_stale_timeout = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 90.0))
+
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
+
+            # Detect stale streams: connections kept alive by SSE pings
+            # but delivering no real chunks.  Kill the client so the
+            # inner retry loop can start a fresh connection.
+            if time.time() - last_chunk_time["t"] > _stream_stale_timeout:
+                logger.warning(
+                    "Stream stale for %.0fs — no chunks received. Killing connection.",
+                    _stream_stale_timeout,
+                )
+                try:
+                    rc = request_client_holder.get("client")
+                    if rc is not None:
+                        self._close_request_openai_client(rc, reason="stale_stream_kill")
+                except Exception:
+                    pass
+                # Reset the timer so we don't kill repeatedly while
+                # the inner thread processes the closure.
+                last_chunk_time["t"] = time.time()
+
             if self._interrupt_requested:
                 try:
                     if self.api_mode == "anthropic_messages":
@@ -4614,7 +4749,7 @@ class AIAgent:
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
             except Exception as e:
-                logger.debug("Session DB compression split failed: %s", e)
+                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         # Reset context pressure warning and token estimate — usage drops
         # after compaction.  Without this, the stale last_prompt_tokens from
@@ -4816,9 +4951,9 @@ class AIAgent:
             is_error, _ = _detect_tool_failure(function_name, result)
             results[index] = (function_name, function_args, result, duration, is_error)
 
-        # Start spinner for CLI mode
+        # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
-        if self.quiet_mode:
+        if self.quiet_mode and not self.tool_progress_callback:
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots')
             spinner.start()
@@ -5044,7 +5179,7 @@ class AIAgent:
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
-                if self.quiet_mode:
+                if self.quiet_mode and not self.tool_progress_callback:
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots')
                     spinner.start()
@@ -5069,13 +5204,15 @@ class AIAgent:
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
-                face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-                emoji = _get_tool_emoji(function_name)
-                preview = _build_tool_preview(function_name, function_args) or function_name
-                if len(preview) > 30:
-                    preview = preview[:27] + "..."
-                spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots')
-                spinner.start()
+                spinner = None
+                if not self.tool_progress_callback:
+                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    emoji = _get_tool_emoji(function_name)
+                    preview = _build_tool_preview(function_name, function_args) or function_name
+                    if len(preview) > 30:
+                        preview = preview[:27] + "..."
+                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots')
+                    spinner.start()
                 _spinner_result = None
                 try:
                     function_result = handle_function_call(
@@ -5091,7 +5228,10 @@ class AIAgent:
                 finally:
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
-                    spinner.stop(cute_msg)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    else:
+                        self._vprint(f"  {cute_msg}")
             else:
                 try:
                     function_result = handle_function_call(
@@ -5631,7 +5771,7 @@ class AIAgent:
             api_call_count += 1
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
-                    self._safe_print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.max_total} total across agent + subagents)")
+                    self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)
@@ -6300,6 +6440,7 @@ class AIAgent:
                         'exceeds the limit', 'context window',
                         'request entity too large',  # OpenRouter/Nous 413 safety net
                         'prompt is too long',  # Anthropic: "prompt is too long: N tokens > M maximum"
+                        'prompt exceeds max length',  # Z.AI / GLM: generic 400 overflow wording
                     ])
 
                     # Fallback heuristic: Anthropic sometimes returns a generic
@@ -7090,7 +7231,7 @@ class AIAgent:
             or self.iteration_budget.remaining <= 0
         ):
             if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
-                print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} used, including subagents)")
+                print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
             final_response = self._handle_max_iterations(messages, api_call_count)
         
         # Determine if conversation completed successfully

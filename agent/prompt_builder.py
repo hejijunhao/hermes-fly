@@ -8,6 +8,8 @@ import logging
 import os
 import re
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -320,7 +322,7 @@ def build_skills_system_prompt(
     match skills by meaning, not just name.
     Filters out skills incompatible with the current OS platform.
     """
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = get_hermes_home()
     skills_dir = hermes_home / "skills"
 
     if not skills_dir.exists():
@@ -354,8 +356,15 @@ def build_skills_system_prompt(
         fm_name = frontmatter.get("name", skill_name)
         if fm_name in disabled or skill_name in disabled:
             continue
-        # Skip skills whose conditional activation rules exclude them
-        conditions = _read_skill_conditions(skill_file)
+        # Extract conditions inline from already-parsed frontmatter
+        # (avoids redundant file re-read that _read_skill_conditions would do)
+        hermes_meta = (frontmatter.get("metadata") or {}).get("hermes") or {}
+        conditions = {
+            "fallback_for_toolsets": hermes_meta.get("fallback_for_toolsets", []),
+            "requires_toolsets": hermes_meta.get("requires_toolsets", []),
+            "fallback_for_tools": hermes_meta.get("fallback_for_tools", []),
+            "requires_tools": hermes_meta.get("requires_tools", []),
+        }
         if not _skill_should_show(conditions, available_tools, available_toolsets):
             continue
         skills_by_category.setdefault(category, []).append((skill_name, desc))
@@ -442,7 +451,7 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "SOUL.md"
+    soul_path = get_hermes_home() / "SOUL.md"
     if not soul_path.exists():
         return None
     try:

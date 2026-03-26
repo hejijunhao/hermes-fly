@@ -7,11 +7,11 @@ Provides options for:
 """
 
 import os
-import sys
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+
+from hermes_constants import get_hermes_home
 
 from hermes_cli.colors import Colors, color
 
@@ -31,11 +31,6 @@ def log_error(msg: str):
 def get_project_root() -> Path:
     """Get the project installation directory."""
     return Path(__file__).parent.parent.resolve()
-
-
-def get_hermes_home() -> Path:
-    """Get the Hermes home directory (~/.hermes)."""
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
 
 def find_shell_configs() -> list:

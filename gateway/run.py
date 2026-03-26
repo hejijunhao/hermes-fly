@@ -76,7 +76,8 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+from hermes_constants import get_hermes_home
+_hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -220,7 +221,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
-from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
@@ -805,6 +806,7 @@ class GatewayRunner:
         "medium", "low", "minimal", "none". Returns None to use default
         (medium).
         """
+        from hermes_constants import parse_reasoning_effort
         effort = ""
         try:
             import yaml as _y
@@ -817,16 +819,10 @@ class GatewayRunner:
             pass
         if not effort:
             effort = os.getenv("HERMES_REASONING_EFFORT", "")
-        if not effort:
-            return None
-        effort = effort.lower().strip()
-        if effort == "none":
-            return {"enabled": False}
-        valid = ("xhigh", "high", "medium", "low", "minimal")
-        if effort in valid:
-            return {"enabled": True, "effort": effort}
-        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
-        return None
+        result = parse_reasoning_effort(effort)
+        if effort and effort.strip() and result is None:
+            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+        return result
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -2394,7 +2390,8 @@ class GatewayRunner:
                 history=history,
                 source=source,
                 session_id=session_entry.session_id,
-                session_key=session_key
+                session_key=session_key,
+                event_message_id=event.message_id,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -2771,8 +2768,6 @@ class GatewayRunner:
         """Handle /model command - show or change the current model."""
         import yaml
         from hermes_cli.models import (
-            parse_model_input,
-            validate_requested_model,
             curated_models_for_provider,
             normalize_provider,
             _PROVIDER_LABELS,
@@ -4844,6 +4839,7 @@ class GatewayRunner:
         session_id: str,
         session_key: str = None,
         _interrupt_depth: int = 0,
+        event_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -4980,7 +4976,12 @@ class GatewayRunner:
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited
-        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        # For DM top-level Slack messages, source.thread_id is None but the
+        # final reply will be threaded under the original message via reply_to.
+        # Use event_message_id as fallback so progress messages land in the
+        # same thread as the final response instead of going to the DM root.
+        _progress_thread_id = source.thread_id or event_message_id
+        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         async def send_progress_messages():
             if not progress_queue:
@@ -5095,7 +5096,7 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -5176,7 +5177,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
                         )
                         _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
@@ -5288,7 +5289,18 @@ class GatewayRunner:
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
-                        agent_history.append({"role": role, "content": content})
+                        entry = {"role": role, "content": content}
+                        # Preserve reasoning fields on assistant messages so
+                        # multi-turn reasoning context survives session reload.
+                        # The agent's _build_api_kwargs converts these to the
+                        # provider-specific format (reasoning_content, etc.).
+                        if role == "assistant":
+                            for _rkey in ("reasoning", "reasoning_details",
+                                          "codex_reasoning_items"):
+                                _rval = msg.get(_rkey)
+                                if _rval:
+                                    entry[_rkey] = _rval
+                        agent_history.append(entry)
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
@@ -5727,7 +5739,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             except Exception:
                 pass
         else:
-            hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
+            hermes_home = str(get_hermes_home())
             logger.error(
                 "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
                 "Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' first.",
