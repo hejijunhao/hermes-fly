@@ -7,8 +7,10 @@ Routes:
   POST /login         → authenticate, set session cookie
   GET  /onboarding    → first-run API key setup page
   POST /onboarding    → validate + persist API key, mark onboarded
-  GET  /terminal      → xterm.js web terminal
+  GET  /terminal      → xterm.js web terminal (hermes agent)
   WS   /ws            → PTY bridge (hermes chat)
+  GET  /cli           → xterm.js web terminal (direct shell)
+  WS   /ws/cli        → PTY bridge (bash)
 """
 
 import asyncio
@@ -21,7 +23,9 @@ import os
 import pty
 import re
 import secrets
+import shutil
 import struct
+import sys
 import termios
 from pathlib import Path
 
@@ -110,6 +114,115 @@ def _read_env_file() -> dict[str, str]:
     return env
 
 
+# ── Machine info ────────────────────────────────────────
+
+
+def _get_machine_info() -> str:
+    """Build an ANSI-styled machine info banner for the CLI terminal."""
+    u = os.uname()
+
+    # OS pretty name
+    os_name = f"{u.sysname} {u.release}"
+    os_release = Path("/etc/os-release")
+    if os_release.exists():
+        for line in os_release.read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split("=", 1)[1].strip().strip('"')
+                break
+
+    # Memory from /proc/meminfo
+    mem_total = mem_avail = "?"
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        info = {}
+        for line in meminfo.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                info[parts[0].rstrip(":")] = int(parts[1])
+        if "MemTotal" in info:
+            mem_total = f"{info['MemTotal'] // 1024} MB"
+        if "MemAvailable" in info:
+            mem_avail = f"{info['MemAvailable'] // 1024} MB"
+
+    # Disk usage
+    def _disk(path: str) -> str:
+        try:
+            usage = shutil.disk_usage(path)
+            used_gb = usage.used / (1024 ** 3)
+            total_gb = usage.total / (1024 ** 3)
+            return f"{used_gb:.1f} GB / {total_gb:.1f} GB used"
+        except Exception:
+            return "?"
+
+    # Uptime from /proc/uptime
+    uptime_str = "?"
+    uptime_path = Path("/proc/uptime")
+    if uptime_path.exists():
+        try:
+            secs = int(float(uptime_path.read_text().split()[0]))
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            parts = []
+            if days:
+                parts.append(f"{days}d")
+            if hours:
+                parts.append(f"{hours}h")
+            parts.append(f"{mins}m")
+            uptime_str = " ".join(parts)
+        except Exception:
+            pass
+
+    # Fly metadata from env vars
+    fly_region = os.getenv("FLY_REGION", "?")
+    fly_app = os.getenv("FLY_APP_NAME", "?")
+    fly_machine = os.getenv("FLY_MACHINE_ID", u.nodename)
+
+    # Build rows: (label, value)
+    rows = [
+        ("OS", os_name),
+        ("Kernel", f"{u.release} {u.machine}"),
+        ("CPU", f"{os.cpu_count() or '?'} core(s)"),
+        ("Memory", f"{mem_total} total / {mem_avail} available"),
+        ("Disk /", _disk("/")),
+        ("Volume", f"{_disk(str(HERMES_HOME))} ({HERMES_HOME})"),
+        ("Region", fly_region),
+        ("App", fly_app),
+        ("Machine", fly_machine),
+        ("Python", sys.version.split()[0]),
+        ("Uptime", uptime_str),
+    ]
+
+    # ANSI escape codes matching the cyberpunk theme
+    R = "\x1b[31m"      # red (borders)
+    C = "\x1b[36m"      # cyan (labels)
+    W = "\x1b[0m"       # reset (values)
+    B = "\x1b[1m"       # bold
+    D = "\x1b[2m"       # dim
+
+    width = 58
+    inner = width - 4  # inside the "│  " and "  │"
+
+    lines = []
+    lines.append(f"{R}┌{'─' * (width - 2)}┐{W}")
+    lines.append(f"{R}│{W}  {B}{R}HERMES // FLY MACHINE{W}{' ' * (inner - 21)}{R}│{W}")
+    lines.append(f"{R}├{'─' * (width - 2)}┤{W}")
+    for label, value in rows:
+        padded_label = f"{C}{label:<10}{W}"
+        # Calculate visible length (label is 10 chars, value is variable)
+        visible_content = f"{label:<10}{value}"
+        padding = inner - len(visible_content)
+        if padding < 0:
+            padding = 0
+        lines.append(f"{R}│{W}  {padded_label}{value}{' ' * padding}{R}│{W}")
+    lines.append(f"{R}└{'─' * (width - 2)}┘{W}")
+    lines.append("")
+    lines.append(f"{D}Type 'exit' to end session. Navigate to /terminal for the Hermes agent.{W}")
+    lines.append("")
+
+    return "\r\n".join(lines) + "\r\n"
+
+
 # ── Routes ───────────────────────────────────────────────
 
 
@@ -184,6 +297,13 @@ async def terminal_page(request: Request):
     return FileResponse(STATIC_DIR / "terminal.html")
 
 
+@app.get("/cli")
+async def cli_page(request: Request):
+    if not _is_authed(request):
+        return RedirectResponse("/login")
+    return FileResponse(STATIC_DIR / "cli.html")
+
+
 # ── Key validation ───────────────────────────────────────
 
 
@@ -250,25 +370,20 @@ def _cleanup_pty(loop, master_fd, proc):
 # ── WebSocket PTY bridge ─────────────────────────────────
 
 
-@app.websocket("/ws")
-async def ws_terminal(ws: WebSocket, provider: str = "openrouter"):
-    if AUTH_PASS and ws.cookies.get(COOKIE_NAME) != _make_token():
-        await ws.close(code=4001)
-        return
-
-    await ws.accept()
-
-    # Build PTY environment: inherit process env + re-read .env for fresh keys
-    env = {**os.environ, "TERM": "xterm-256color"}
-    env.update(_read_env_file())
-
-    # Build command
-    cmd = ["hermes", "chat"]
-    if provider in ("nous", "openrouter"):
-        cmd.extend(["--provider", provider])
-
+async def _ws_pty_bridge(
+    ws: WebSocket,
+    cmd: list[str],
+    env: dict[str, str],
+    banner: str | None = None,
+    exit_message: str = "process exited",
+) -> None:
+    """Generic WebSocket ↔ PTY bridge. Used by both /ws and /ws/cli."""
     proc, master_fd = await _spawn_pty_async(cmd, env)
     logger.info("PTY spawned: pid=%s cmd=%s", proc.pid, cmd)
+
+    # Send banner before PTY output starts
+    if banner:
+        await ws.send_text(banner)
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -296,7 +411,7 @@ async def ws_terminal(ws: WebSocket, provider: str = "openrouter"):
             if data is None:
                 try:
                     await ws.send_text(
-                        "\r\n\x1b[31m[hermes process exited — refresh to reconnect]\x1b[0m\r\n"
+                        f"\r\n\x1b[31m[{exit_message} — refresh to reconnect]\x1b[0m\r\n"
                     )
                     await ws.close(code=1000, reason="PTY exited")
                 except Exception:
@@ -349,6 +464,41 @@ async def ws_terminal(ws: WebSocket, provider: str = "openrouter"):
         watcher.cancel()
         _cleanup_pty(loop, master_fd, proc)
         logger.info("WebSocket session cleaned up: pid=%s", proc.pid)
+
+
+@app.websocket("/ws")
+async def ws_terminal(ws: WebSocket, provider: str = "openrouter"):
+    if AUTH_PASS and ws.cookies.get(COOKIE_NAME) != _make_token():
+        await ws.close(code=4001)
+        return
+
+    await ws.accept()
+
+    env = {**os.environ, "TERM": "xterm-256color"}
+    env.update(_read_env_file())
+
+    cmd = ["hermes", "chat"]
+    if provider in ("nous", "openrouter"):
+        cmd.extend(["--provider", provider])
+
+    await _ws_pty_bridge(ws, cmd, env, exit_message="hermes process exited")
+
+
+@app.websocket("/ws/cli")
+async def ws_cli(ws: WebSocket):
+    if AUTH_PASS and ws.cookies.get(COOKIE_NAME) != _make_token():
+        await ws.close(code=4001)
+        return
+
+    await ws.accept()
+
+    env = {**os.environ, "TERM": "xterm-256color"}
+    env.update(_read_env_file())
+
+    banner = _get_machine_info()
+    cmd = ["/bin/bash", "--login"]
+
+    await _ws_pty_bridge(ws, cmd, env, banner=banner, exit_message="shell exited")
 
 
 # Static assets (must be last to avoid catching other routes)
