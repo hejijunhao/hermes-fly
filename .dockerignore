@@ -1,12 +1,32 @@
+# Git
 .git
 .gitignore
+.gitmodules
+
+# Dependencies
+node_modules
+**/node_modules
+.venv
+**/.venv
+venv
+
+# CI/CD
+.github
+
+# Environment files
 .env
+
+# Docs and metadata not needed in image build context
+*.md
 docs/
 LICENSE
 README.md
+
+# Runtime data (bind-mounted at /opt/data; must not leak into build context)
+data/
+
+# Local noise
 .DS_Store
 __pycache__
 *.pyc
-.venv
-venv
 .claude

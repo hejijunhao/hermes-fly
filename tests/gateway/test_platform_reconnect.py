@@ -14,8 +14,15 @@ from gateway.run import GatewayRunner
 class StubAdapter(BasePlatformAdapter):
     """Adapter whose connect() result can be controlled."""
 
-    def __init__(self, *, succeed=True, fatal_error=None, fatal_retryable=True):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+    def __init__(
+        self,
+        *,
+        platform=Platform.TELEGRAM,
+        succeed=True,
+        fatal_error=None,
+        fatal_retryable=True,
+    ):
+        super().__init__(PlatformConfig(enabled=True, token="test"), platform)
         self._succeed = succeed
         self._fatal_error = fatal_error
         self._fatal_retryable = fatal_retryable
@@ -59,10 +66,90 @@ def _make_runner():
     runner._honcho_managers = {}
     runner._honcho_configs = {}
     runner._shutdown_all_gateway_honcho = lambda: None
+    runner.session_store = MagicMock()
     return runner
 
 
 # --- Startup queueing ---
+
+class TestStartupPlatformIsolation:
+    """Verify one blocked platform cannot prevent later platforms from starting."""
+
+    @pytest.mark.asyncio
+    async def test_start_continues_after_platform_connect_timeout(self, tmp_path):
+        """A timeout on Telegram should queue it and still connect Feishu."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="test"),
+                Platform.FEISHU: PlatformConfig(enabled=True, token="test"),
+            },
+            sessions_dir=tmp_path,
+        )
+        runner.hooks = MagicMock()
+        runner.hooks.loaded_hooks = []
+        runner.hooks.emit = AsyncMock()
+        runner._suspend_stuck_loop_sessions = MagicMock(return_value=0)
+        runner._update_runtime_status = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._send_update_notification = AsyncMock(return_value=True)
+        runner._send_restart_notification = AsyncMock()
+
+        adapters = {
+            Platform.TELEGRAM: StubAdapter(platform=Platform.TELEGRAM),
+            Platform.FEISHU: StubAdapter(platform=Platform.FEISHU),
+        }
+        runner._create_adapter = MagicMock(
+            side_effect=lambda platform, _config: adapters[platform]
+        )
+        runner._connect_adapter_with_timeout = AsyncMock(
+            side_effect=[
+                TimeoutError("telegram connect timed out after 30s"),
+                True,
+            ]
+        )
+
+        def fake_create_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("gateway.status.write_runtime_status"):
+            with patch("hermes_cli.plugins.discover_plugins"):
+                with patch("hermes_cli.config.load_config", return_value={}):
+                    with patch("agent.shell_hooks.register_from_config"):
+                        with patch(
+                            "tools.process_registry.process_registry.recover_from_checkpoint",
+                            return_value=0,
+                        ):
+                            with patch(
+                                "gateway.channel_directory.build_channel_directory",
+                                new=AsyncMock(return_value={"platforms": {}}),
+                            ):
+                                with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
+                                    assert await runner.start() is True
+
+        assert Platform.TELEGRAM in runner._failed_platforms
+        assert Platform.FEISHU in runner.adapters
+        assert Platform.TELEGRAM not in runner.adapters
+        assert runner._create_adapter.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_connect_adapter_timeout_raises_retryable_exception(self, monkeypatch):
+        """The timeout helper turns a hanging connect into a caught startup error."""
+        runner = _make_runner()
+        adapter = StubAdapter()
+
+        async def hang():
+            await asyncio.sleep(60)
+            return True
+
+        adapter.connect = hang
+        monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.001")
+
+        with pytest.raises(TimeoutError, match="telegram connect timed out"):
+            await runner._connect_adapter_with_timeout(adapter, Platform.TELEGRAM)
+
 
 class TestStartupFailureQueuing:
     """Verify that failed platforms are queued during startup."""
@@ -344,6 +431,7 @@ class TestRuntimeDisconnectQueuing:
     async def test_retryable_runtime_error_queued_for_reconnect(self):
         """Retryable runtime errors should add the platform to _failed_platforms."""
         runner = _make_runner()
+        runner.stop = AsyncMock()
 
         adapter = StubAdapter(succeed=True)
         adapter._set_fatal_error("network_error", "DNS failure", retryable=True)
@@ -371,8 +459,12 @@ class TestRuntimeDisconnectQueuing:
         assert Platform.TELEGRAM not in runner._failed_platforms
 
     @pytest.mark.asyncio
-    async def test_retryable_error_prevents_shutdown_when_queued(self):
-        """Gateway should not shut down if failed platforms are queued for reconnection."""
+    async def test_retryable_error_exits_for_service_restart_when_all_down(self):
+        """Gateway should exit with failure when all platforms fail with retryable errors.
+
+        This lets systemd Restart=on-failure restart the process, which is more
+        reliable than in-process background reconnection after exhausted retries.
+        """
         runner = _make_runner()
         runner.stop = AsyncMock()
 
@@ -382,7 +474,28 @@ class TestRuntimeDisconnectQueuing:
 
         await runner._handle_adapter_fatal_error(adapter)
 
-        # stop() should NOT have been called since we have platforms queued
+        # stop() SHOULD be called — gateway exits for systemd restart
+        runner.stop.assert_called_once()
+        assert runner._exit_with_failure is True
+        assert Platform.TELEGRAM in runner._failed_platforms
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_no_exit_when_other_adapters_still_connected(self):
+        """Gateway should NOT exit if some adapters are still connected."""
+        runner = _make_runner()
+        runner.stop = AsyncMock()
+
+        failing_adapter = StubAdapter(succeed=True)
+        failing_adapter._set_fatal_error("network_error", "DNS failure", retryable=True)
+        runner.adapters[Platform.TELEGRAM] = failing_adapter
+
+        # Another adapter is still connected
+        healthy_adapter = StubAdapter(succeed=True)
+        runner.adapters[Platform.DISCORD] = healthy_adapter
+
+        await runner._handle_adapter_fatal_error(failing_adapter)
+
+        # stop() should NOT have been called — Discord is still up
         runner.stop.assert_not_called()
         assert Platform.TELEGRAM in runner._failed_platforms
 

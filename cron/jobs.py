@@ -9,17 +9,19 @@ import copy
 import json
 import logging
 import tempfile
+import threading
 import os
 import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Union
 
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from utils import atomic_replace
 
 try:
     from croniter import croniter
@@ -31,9 +33,14 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-HERMES_DIR = get_hermes_home()
+HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+
+# In-process lock protecting load_jobs→modify→save_jobs cycles.
+# Required when tick() runs jobs in parallel threads — without this,
+# concurrent mark_job_run / advance_next_run calls can clobber each other.
+_jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -305,8 +312,22 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
     elif schedule["kind"] == "cron":
         if not HAS_CRONITER:
+            logger.warning(
+                "Cannot compute next run for cron schedule %r: 'croniter' is "
+                "not installed. croniter is a core dependency as of v0.9.x; "
+                "reinstall hermes-agent or run 'pip install croniter' in your "
+                "runtime env.",
+                schedule.get("expr"),
+            )
             return None
-        cron = croniter(schedule["expr"], now)
+        # Use last_run_at as the croniter base when available, consistent
+        # with interval jobs.  This ensures that after a crash/restart,
+        # the next run is anchored to the actual last execution time
+        # rather than to an arbitrary restart time.
+        base_time = now
+        if last_run_at:
+            base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
+        cron = croniter(schedule["expr"], base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()
 
@@ -327,8 +348,23 @@ def load_jobs() -> List[Dict[str, Any]]:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             return data.get("jobs", [])
-    except (json.JSONDecodeError, IOError):
-        return []
+    except json.JSONDecodeError:
+        # Retry with strict=False to handle bare control chars in string values
+        try:
+            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read(), strict=False)
+                jobs = data.get("jobs", [])
+                if jobs:
+                    # Auto-repair: rewrite with proper escaping
+                    save_jobs(jobs)
+                    logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+                return jobs
+        except Exception as e:
+            logger.error("Failed to auto-repair jobs.json: %s", e)
+            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+    except IOError as e:
+        logger.error("IOError reading jobs.json: %s", e)
+        raise RuntimeError(f"Failed to read cron database: {e}") from e
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
@@ -340,7 +376,7 @@ def save_jobs(jobs: List[Dict[str, Any]]):
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, JOBS_FILE)
+        atomic_replace(tmp_path, JOBS_FILE)
         _secure_file(JOBS_FILE)
     except BaseException:
         try:
@@ -348,6 +384,39 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         except OSError:
             pass
         raise
+
+
+def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
+    """Normalize and validate a cron job workdir.
+
+    Rules:
+      - Empty / None → None (feature off, preserves old behaviour).
+      - ``~`` is expanded.  Relative paths are rejected — cron jobs run detached
+        from any shell cwd, so relative paths have no stable meaning.
+      - The path must exist and be a directory at create/update time.  We do
+        NOT re-check at run time (a user might briefly unmount the dir; the
+        scheduler will just fall back to old behaviour with a logged warning).
+
+    Returns the absolute path string, or None when disabled.
+    Raises ValueError on invalid input.
+    """
+    if workdir is None:
+        return None
+    raw = str(workdir).strip()
+    if not raw:
+        return None
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(
+            f"Cron workdir must be an absolute path (got {raw!r}). "
+            f"Cron jobs run detached from any shell cwd, so relative paths are ambiguous."
+        )
+    resolved = expanded.resolve()
+    if not resolved.exists():
+        raise ValueError(f"Cron workdir does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"Cron workdir is not a directory: {resolved}")
+    return str(resolved)
 
 
 def create_job(
@@ -362,6 +431,10 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    script: Optional[str] = None,
+    context_from: Optional[Union[str, List[str]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    workdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -378,6 +451,21 @@ def create_job(
         model: Optional per-job model override
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
+        script: Optional path to a Python script whose stdout is injected into the
+                prompt each run.  The script runs before the agent turn, and its output
+                is prepended as context.  Useful for data collection / change detection.
+        context_from: Optional job ID (or list of job IDs) whose most recent output
+                      is injected into the prompt as context before each run.
+                      Useful for chaining cron jobs: job A finds data, job B processes it.
+        enabled_toolsets: Optional list of toolset names to restrict the agent to.
+                          When set, only tools from these toolsets are loaded, reducing
+                          token overhead. When omitted, all default tools are loaded.
+        workdir: Optional absolute path.  When set, the job runs as if launched
+                from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
+                that directory are injected into the system prompt, and the
+                terminal/file/code_exec tools use it as their working directory
+                (via TERMINAL_CWD).  When unset, the old behaviour is preserved
+                (no context files injected, tools use the scheduler's cwd).
 
     Returns:
         The created job dict
@@ -406,6 +494,19 @@ def create_job(
     normalized_model = normalized_model or None
     normalized_provider = normalized_provider or None
     normalized_base_url = normalized_base_url or None
+    normalized_script = str(script).strip() if isinstance(script, str) else None
+    normalized_script = normalized_script or None
+    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
+    normalized_toolsets = normalized_toolsets or None
+    normalized_workdir = _normalize_workdir(workdir)
+
+    # Normalize context_from: accept str or list of str, store as list or None
+    if isinstance(context_from, str):
+        context_from = [context_from.strip()] if context_from.strip() else None
+    elif isinstance(context_from, list):
+        context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
+    else:
+        context_from = None
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
@@ -417,6 +518,8 @@ def create_job(
         "model": normalized_model,
         "provider": normalized_provider,
         "base_url": normalized_base_url,
+        "script": normalized_script,
+        "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -432,9 +535,12 @@ def create_job(
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
+        "last_delivery_error": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "enabled_toolsets": normalized_toolsets,
+        "workdir": normalized_workdir,
     }
 
     jobs = load_jobs()
@@ -468,6 +574,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if job["id"] != job_id:
             continue
 
+        # Validate / normalize workdir if present in updates.  Empty string or
+        # None both mean "clear the field" (restore old behaviour).
+        if "workdir" in updates:
+            _wd = updates["workdir"]
+            if _wd in (None, "", False):
+                updates["workdir"] = None
+            else:
+                updates["workdir"] = _normalize_workdir(_wd)
+
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
 
@@ -478,6 +593,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         if schedule_changed:
             updated_schedule = updated["schedule"]
+            # The API may pass schedule as a raw string (e.g. "every 10m")
+            # instead of a pre-parsed dict.  Normalize it the same way
+            # create_job() does so downstream code can call .get() safely.
+            if isinstance(updated_schedule, str):
+                updated_schedule = parse_schedule(updated_schedule)
+                updated["schedule"] = updated_schedule
             updated["schedule_display"] = updates.get(
                 "schedule_display",
                 updated_schedule.get("display", updated.get("schedule_display")),
@@ -554,48 +675,106 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
+def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
+                 delivery_error: Optional[str] = None):
     """
     Mark a job as having been run.
     
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
+
+    ``delivery_error`` is tracked separately from the agent error — a job
+    can succeed (agent produced output) but fail delivery (platform down).
     """
-    jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] == job_id:
-            now = _hermes_now().isoformat()
-            job["last_run_at"] = now
-            job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
-            
-            # Increment completed count
-            if job.get("repeat"):
-                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                now = _hermes_now().isoformat()
+                job["last_run_at"] = now
+                job["last_status"] = "ok" if success else "error"
+                job["last_error"] = error if not success else None
+                # Track delivery failures separately — cleared on successful delivery
+                job["last_delivery_error"] = delivery_error
                 
-                # Check if we've hit the repeat limit
-                times = job["repeat"].get("times")
-                completed = job["repeat"]["completed"]
-                if times is not None and times > 0 and completed >= times:
-                    # Remove the job (limit reached)
-                    jobs.pop(i)
+                # Increment completed count
+                if job.get("repeat"):
+                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+                    
+                    # Check if we've hit the repeat limit
+                    times = job["repeat"].get("times")
+                    completed = job["repeat"]["completed"]
+                    if times is not None and times > 0 and completed >= times:
+                        # Remove the job (limit reached)
+                        jobs.pop(i)
+                        save_jobs(jobs)
+                        return
+                
+                # Compute next run
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                # If no next run, decide whether this is terminal completion
+                # (one-shot) or a transient failure (recurring schedule couldn't
+                # compute — e.g. 'croniter' missing from the runtime env).
+                # Recurring jobs must NEVER be silently disabled: that turns a
+                # missing runtime dep into "job completed" and the user's
+                # schedule quietly goes off. See issue #16265.
+                if job["next_run_at"] is None:
+                    kind = job.get("schedule", {}).get("kind")
+                    if kind in ("cron", "interval"):
+                        job["state"] = "error"
+                        if not job.get("last_error"):
+                            job["last_error"] = (
+                                "Failed to compute next run for recurring "
+                                "schedule (is the 'croniter' package "
+                                "installed in the gateway's Python env?)"
+                            )
+                        logger.error(
+                            "Job '%s' (%s) could not compute next_run_at; "
+                            "leaving enabled and marking state=error so the "
+                            "job is not silently disabled.",
+                            job.get("name", job["id"]),
+                            kind,
+                        )
+                    else:
+                        job["enabled"] = False
+                        job["state"] = "completed"
+                elif job.get("state") != "paused":
+                    job["state"] = "scheduled"
+
+                save_jobs(jobs)
+                return
+
+        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def advance_next_run(job_id: str) -> bool:
+    """Preemptively advance next_run_at for a recurring job before execution.
+
+    Call this BEFORE run_job() so that if the process crashes mid-execution,
+    the job won't re-fire on the next gateway restart.  This converts the
+    scheduler from at-least-once to at-most-once for recurring jobs — missing
+    one run is far better than firing dozens of times in a crash loop.
+
+    One-shot jobs are left unchanged so they can still retry on restart.
+
+    Returns True if next_run_at was advanced, False otherwise.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                kind = job.get("schedule", {}).get("kind")
+                if kind not in ("cron", "interval"):
+                    return False
+                now = _hermes_now().isoformat()
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
                     save_jobs(jobs)
-                    return
-            
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
-
-            # If no next run (one-shot completed), disable
-            if job["next_run_at"] is None:
-                job["enabled"] = False
-                job["state"] = "completed"
-            elif job.get("state") != "paused":
-                job["state"] = "scheduled"
-
-            save_jobs(jobs)
-            return
-    
-    save_jobs(jobs)
+                    return True
+                return False
+        return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
@@ -693,7 +872,7 @@ def save_job_output(job_id: str, output: str):
             f.write(output)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, output_file)
+        atomic_replace(tmp_path, output_file)
         _secure_file(output_file)
     except BaseException:
         try:

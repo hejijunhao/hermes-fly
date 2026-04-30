@@ -456,7 +456,7 @@ async def _monitor_training_run(run_state: RunState):
         
         if run_state.api_process and run_state.api_process.poll() is not None:
             run_state.status = "failed"
-            run_state.error_message = f"API server exited unexpectedly"
+            run_state.error_message = "API server exited unexpectedly"
             _stop_training_run(run_state)
             break
 
@@ -567,7 +567,7 @@ async def rl_select_environment(name: str) -> str:
     
     TIP: Read the returned file_path to understand how the environment works.
     """
-    global _current_env, _current_config, _env_config_cache
+    global _current_env, _current_config
     
     _initialize_environments()
     
@@ -673,8 +673,6 @@ async def rl_edit_config(field: str, value: Any) -> str:
     Returns:
         JSON string with updated config or error message
     """
-    global _current_config
-    
     if not _current_env:
         return json.dumps({
             "error": "No environment selected. Use rl_select_environment(name) first.",
@@ -727,8 +725,6 @@ async def rl_start_training() -> str:
     Returns:
         JSON string with run_id and initial status
     """
-    global _active_runs
-    
     if not _current_env:
         return json.dumps({
             "error": "No environment selected. Use rl_select_environment(name) first.",
@@ -829,8 +825,6 @@ async def rl_check_status(run_id: str) -> str:
     Returns:
         JSON string with run status and metrics
     """
-    global _last_status_check
-    
     # Check rate limiting
     now = time.time()
     if run_id in _last_status_check:
@@ -1233,11 +1227,11 @@ async def rl_test_inference(
                 print(f"\n  ❌ Error: {model_results['error']}")
                 # Print last few lines of stderr for debugging
                 if stderr_lines:
-                    print(f"  Last errors:")
+                    print("  Last errors:")
                     for line in stderr_lines[-5:]:
                         print(f"    {line}")
             else:
-                print(f"\n  ✅ Process completed successfully")
+                print("\n  ✅ Process completed successfully")
                 print(f"  Output file: {output_file}")
                 print(f"  File exists: {output_file.exists()}")
                 
@@ -1272,7 +1266,7 @@ async def rl_test_inference(
                     
         except asyncio.TimeoutError:
             model_results["error"] = "Process timed out after 10 minutes"
-            print(f"  Timeout!")
+            print("  Timeout!")
         except Exception as e:
             model_results["error"] = str(e)
             print(f"  Error: {e}")
@@ -1311,7 +1305,7 @@ async def rl_test_inference(
         "avg_accuracy": round(
             sum(m.get("accuracy", 0) for m in working_models) / len(working_models), 3
         ) if working_models else 0,
-        "environment_working": len(working_models) > 0,
+        "environment_working": bool(working_models),
         "output_directory": str(test_output_dir),
     }
     
